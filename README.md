@@ -10,6 +10,17 @@ The repository is organized into the following sections:
 	•	preprocessing/: Contains scripts for preprocessing datasets, including data cleaning, text tokenization, and format adjustments.
 	•	data/: Holds sample datasets (if provided) for testing and reproducing the analysis.
 
- arXiv preprint: TKTK
+BRIDGING THE DIVIDE: GLOBAL HEALTH AND INTERNATIONAL DEVELOPMENT POLICY PRIORITIES IN THE BIDEN AND TRUMP ERAS
+by
+William Powell
+
+Signature Work Product, in partial fulfillment of the Duke Kunshan University Undergraduate Degree Program
+
+March 9, 2025
+
+Signature Work Program
+Duke Kunshan University
+
+arXiv preprint: TKTK
 
  
