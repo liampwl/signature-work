@@ -1,0 +1,24 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Data & outputs
+*.csv
+results_*/
+outputs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (too large for git)
+*.safetensors
+*.bin
+topic_model/
