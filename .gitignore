@@ -6,6 +6,7 @@ __pycache__/
 
 # Data & outputs
 *.csv
+!legacy/**/*.csv
 results_*/
 outputs/
 
@@ -22,3 +23,8 @@ Thumbs.db
 *.safetensors
 *.bin
 topic_model/
+
+# v2 data, caches
+data/
+*.npy
+umap_cache/

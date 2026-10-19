@@ -1,270 +1,452 @@
 """
-Text preprocessing: PDF extraction (OCR), text cleaning, and stopword management.
+Stage 1: PDF -> paragraphs -> embedding-sized chunks.
 
-Combines functionality from the original `ocr revision for a new csv.py` and the
-shared `load_and_clean_data` / `get_enhanced_stopwords` helpers.
+What changed from the thesis (v1) pipeline, and why:
+
+* Paragraphs come from PyMuPDF text *blocks*, not from splitting page text on
+  blank lines. PyMuPDF's plain-text output rarely contains blank lines, so v1
+  produced roughly one "paragraph" per page.
+* Running headers/footers are detected per document and removed instead of
+  being embedded on every page.
+* Long paragraphs are split at sentence boundaries so that chunks fit the
+  embedding model's context window (v1 silently truncated at 128 tokens).
+* Filters no longer drop prose that starts with "However," etc., and no longer
+  delete everything in parentheses (which removed acronyms like PEPFAR).
+* Language detection is seeded, keeps anything not confidently non-English,
+  and is applied per paragraph.
+* Full publication dates (not just the year) drive the administration label,
+  so 1-19 January 2021 is no longer counted as Biden.
+* A manifest with MD5 hashes records every PDF and what happened to it, so the
+  corpus can be archived and reconstructed now that the DEC is offline.
 """
 
 from __future__ import annotations
 
-import csv
-import os
+import hashlib
 import re
-from typing import List, Tuple
+import unicodedata
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from pathlib import Path
 
-import fitz  # PyMuPDF
 import pandas as pd
-from langdetect import LangDetectException, detect
-from nltk.corpus import stopwords
 from tqdm import tqdm
 
+import config as cfg
 from src.utils import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Stopwords
-# ---------------------------------------------------------------------------
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24
+except ImportError:  # pragma: no cover
+    import fitz
 
-def get_enhanced_stopwords() -> list[str]:
-    """
-    Comprehensive stopword list for USAID policy document analysis.
+from langdetect import DetectorFactory, LangDetectException, detect_langs
 
-    Includes standard English stopwords plus domain-specific terms that add
-    noise to topic models (publication boilerplate, date references, document
-    structure terms, non-English fragments, etc.).
-    """
-    basic = list(stopwords.words("english"))
-
-    publication = [
-        "prepared", "publication", "suggested", "citation", "isbn", "report",
-        "washington", "dc", "agreement", "review", "official",
-        "views", "positions", "contents", "executive", "summary",
-        "background", "overview", "methodology", "appendix", "annex",
-    ]
-
-    structure = [
-        "page", "section", "chapter", "paragraph", "figure", "table",
-        "reference", "bibliography", "footnote", "note", "volume", "https", "www",
-    ]
-
-    time_terms = [
-        "january", "february", "march", "april", "may", "june", "july",
-        "august", "september", "october", "november", "december",
-        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct",
-        "nov", "dec", "month", "monthly", "quarter", "quarterly", "annual",
-        "annually", "year", "years", "fiscal", "fy",
-        "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023",
-        "fy17", "fy18",
-    ]
-
-    non_english_fragments = [
-        "pennsylvania ave", "de", "la", "les", "en", "des", "et", "le",
-        "de la", "du", "para", "dan", "pa", "za", "ke", "ali", "tes",
-        "primer", "wa", "ts", "ee", "tr", "ea", "ti", "te", "ie", "io",
-        "ro", "sb", "fn", "aa", "uo", "ye", "na na na", "na", "na na",
-        "tbd", "90 90", "600", "200", "85", "90",
-    ]
-
-    admin = [
-        "total", "number", "percent", "frequency", "details",
-        "questionnaire", "respondents", "procedure", "guidelines",
-    ]
-
-    org = [
-        "outreach", "reference", "budget", "procurement",
-        "cooperative", "agreement", "implemented",
-    ]
-
-    combined = basic + publication + structure + time_terms + non_english_fragments + admin + org
-    return list(set(combined))
+DetectorFactory.seed = cfg.LANGDETECT_SEED
 
 
 # ---------------------------------------------------------------------------
-# Text cleaning helpers
+# Dates and administrations
 # ---------------------------------------------------------------------------
 
-_CLEANING_PATTERNS = [
-    r"ISBN-: ----",
-    r"AID-OAA-A--",
-    r"\s{2,}",
-    r"\.{3,}",
-    r"\([^\)]*\)",
-    r"\d+\.\d+\.\d+",
-    r"^\s*\d+\.",
-    r"Figure \d+",
-    r"Table \d+",
-]
+_FILENAME_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
 
-def clean_text(text: str) -> str:
-    """Apply regex-based cleaning to a single document string."""
-    for pattern in _CLEANING_PATTERNS:
-        text = re.sub(pattern, " ", text)
+def date_from_filename(filename: str) -> date | None:
+    """Parse the first YYYY-MM-DD in a filename (v1 files: document_YYYY-MM-DD_XXX.pdf)."""
+    m = _FILENAME_DATE.search(filename)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def administration_for(d: date | None) -> str:
+    if d is None:
+        return "Unknown"
+    if cfg.TRUMP_START <= d < cfg.BIDEN_START:
+        return "Trump"
+    if cfg.BIDEN_START <= d < cfg.BIDEN_END:
+        return "Biden"
+    return "Other"
+
+
+# ---------------------------------------------------------------------------
+# Text normalisation
+# ---------------------------------------------------------------------------
+
+_URL = re.compile(r"https?://\S+|www\.\S+")
+_EMAIL = re.compile(r"\S+@\S+\.\w+")
+_DOT_LEADER = re.compile(r"(?:\s?\.){4,}")
+_HYPHEN_BREAK = re.compile(r"(\w)-\n(\w)")
+_BULLETS = re.compile(r"^[•●▪■–—\-\*o]\s+", re.M)
+
+
+def normalise_block(text: str) -> str:
+    """Unicode-normalise, repair line-break hyphenation, and flatten a block to one line."""
+    text = unicodedata.normalize("NFKC", text)
+    text = _HYPHEN_BREAK.sub(r"\1\2", text)
+    text = _BULLETS.sub("", text)
+    text = text.replace("\n", " ")
+    text = _URL.sub(" ", text)
+    text = _EMAIL.sub(" ", text)
+    text = _DOT_LEADER.sub(" ", text)
     return " ".join(text.split())
 
 
-# ---------------------------------------------------------------------------
-# CSV data loading (for stages 2 & 3)
-# ---------------------------------------------------------------------------
-
-def load_and_clean_data(
-    file_path: str,
-    output_dir: str,
-) -> Tuple[List[str], List[int], List[str]]:
-    """
-    Load the paragraph CSV, clean text, assign administration labels, and
-    save yearly paragraph counts.
-
-    Returns (documents, timestamps, administrations).
-    """
-    logger.info("Loading data from %s …", file_path)
-    df = pd.read_csv(file_path, dtype={"year": int}, low_memory=False)
-    logger.info("Loaded %d paragraphs  |  columns: %s", len(df), df.columns.tolist())
-
-    # Clean text
-    tqdm.pandas(desc="Cleaning text")
-    df["text"] = df["text"].astype(str).progress_apply(clean_text)
-
-    # Administration labels
-    df["administration"] = df["year"].apply(
-        lambda y: "Biden" if y >= 2021 else ("Trump" if y >= 2017 else "Other")
-    )
-
-    # Log stats
-    logger.info("Year range: %d – %d", df["year"].min(), df["year"].max())
-    for admin, count in df["administration"].value_counts().items():
-        logger.info("  %s: %d paragraphs", admin, count)
-
-    # Save yearly counts
-    yearly = (
-        df["year"]
-        .value_counts()
-        .reset_index()
-        .rename(columns={"index": "year", "year": "num_paragraphs"})
-        .sort_values("year")
-    )
-    os.makedirs(output_dir, exist_ok=True)
-    yearly_path = os.path.join(output_dir, "yearly_paragraph_counts.csv")
-    yearly.to_csv(yearly_path, index=False)
-    logger.info("Saved yearly counts → %s", yearly_path)
-
-    return df["text"].tolist(), df["year"].tolist(), df["administration"].tolist()
+def _header_key(text: str) -> str:
+    """Key used to spot repeated headers/footers: lowercase, digits collapsed."""
+    return re.sub(r"\d+", "#", text.lower()).strip()
 
 
 # ---------------------------------------------------------------------------
-# PDF / OCR extraction (stage 1)
+# Paragraph filters
 # ---------------------------------------------------------------------------
 
-# Languages to skip during paragraph filtering
-_UNWANTED_LANGUAGES = {"id", "fr", "es", "ar", "th"}
+_TOC_LINE = re.compile(r"(?:\s?\.){4,}\s*\d+\s*$")
+_REF_SIGNALS = re.compile(
+    r"\bet al\.|\bdoi\b|\bretrieved from\b|\bpp\.\s*\d|\bvol\.\s*\d|\bjournal of\b|\(\s*(?:19|20)\d{2}[a-z]?\s*\)",
+    re.I,
+)
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+_NON_LATIN = re.compile(r"[^\x00-ɏḀ-ỿ -⁯₠-⃏℀-⅏]")
+_SECTION_STOP = re.compile(
+    r"^(references|bibliography|works cited|endnotes|acronyms( and abbreviations)?|abbreviations|list of acronyms)$",
+    re.I,
+)
 
 
-def _is_valid_paragraph(text: str, min_words: int = 10, counters: dict | None = None) -> bool:
-    """Determine whether an extracted paragraph should be kept."""
-    c = counters  # shorthand; may be None
+@dataclass
+class FilterCounts:
+    counts: Counter = field(default_factory=Counter)
 
-    if "." * 80 in text:
-        if c: c["table_of_contents"] += 1
+    def hit(self, reason: str) -> bool:
+        self.counts[reason] += 1
         return False
-    if "ACRONYMS AND ABBREVIATIONS" in text:
-        if c: c["acronyms"] += 1
-        return False
-    if re.search(r"[\u0E00-\u0E7F\u0600-\u06FF]", text):
-        if c: c["non_latin"] += 1
-        return False
-    if len(text.split()) < min_words:
-        if c: c["short_paragraph"] += 1
-        return False
-    if len(re.findall(r"\d", text)) / max(len(text), 1) > 0.2:
-        if c: c["too_many_numbers"] += 1
-        return False
-    if text.isupper():
-        if c: c["all_caps"] += 1
-        return False
-    if re.match(r"^(\d+\.|[A-Z][a-z]+\s*,|et al\.)", text):
-        if c: c["references"] += 1
-        return False
+
+
+def keep_paragraph(text: str, fc: FilterCounts) -> bool:
+    words = text.split()
+    n_words = len(words)
+    if n_words < cfg.MIN_PARAGRAPH_WORDS:
+        return fc.hit("short")
+
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return fc.hit("no_letters")
+    if sum(1 for c in letters if _NON_LATIN.match(c)) / len(letters) > 0.2:
+        return fc.hit("non_latin_script")
+
+    alnum = sum(1 for c in text if c.isalnum())
+    if alnum and sum(1 for c in text if c.isdigit()) / alnum > 0.3:
+        return fc.hit("numeric_table")
+
+    if sum(1 for c in letters if c.isupper()) / len(letters) > 0.8:
+        return fc.hit("all_caps")
+
+    # Reference-list entries: short, carry a year, and carry a citation signal.
+    if n_words < 80 and _YEAR.search(text) and _REF_SIGNALS.search(text):
+        return fc.hit("reference_entry")
+
     try:
-        if detect(text) in _UNWANTED_LANGUAGES:
-            if c: c["unwanted_language"] += 1
-            return False
+        langs = detect_langs(text)
+        top = langs[0]
+        if top.lang != "en" and top.prob >= cfg.NON_ENGLISH_MIN_PROB:
+            return fc.hit(f"language_{top.lang}")
     except LangDetectException:
         pass
 
     return True
 
 
-def _extract_paragraphs_from_pdf(pdf_path: str, counters: dict | None = None) -> list[str]:
-    """Extract and filter paragraphs from a single PDF."""
-    pdf_path = str(pdf_path)
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"File not found: {pdf_path}")
+# ---------------------------------------------------------------------------
+# Sentence-aware chunking
+# ---------------------------------------------------------------------------
 
-    paragraphs: list[str] = []
+_SENT_SPLIT = re.compile(r"(?<=[.!?;])\s+(?=[A-Z0-9\"“(])")
+
+
+def chunk_paragraph(text: str, max_words: int = cfg.MAX_CHUNK_WORDS) -> list[str]:
+    """Split a paragraph into chunks of <= max_words, breaking at sentence ends where possible."""
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    for sent in _SENT_SPLIT.split(text):
+        sw = sent.split()
+        # Sentence longer than the limit: hard-split it.
+        while len(sw) > max_words:
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+            chunks.append(" ".join(sw[:max_words]))
+            sw = sw[max_words:]
+        if len(current) + len(sw) > max_words and current:
+            chunks.append(" ".join(current))
+            current = []
+        current.extend(sw)
+    if current:
+        # Fold a tiny tail into the previous chunk rather than emitting a fragment.
+        if chunks and len(current) < cfg.MIN_PARAGRAPH_WORDS and len(chunks[-1].split()) + len(current) <= max_words * 1.2:
+            chunks[-1] = chunks[-1] + " " + " ".join(current)
+        else:
+            chunks.append(" ".join(current))
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Per-PDF extraction
+# ---------------------------------------------------------------------------
+
+def _ends_sentence(text: str) -> bool:
+    return bool(re.search(r"[.!?\"”')\]]\s*$", text))
+
+
+def extract_paragraphs(pdf_path: Path, fc: FilterCounts) -> tuple[list[dict], dict]:
+    """
+    Return (paragraph records, per-document info) for one PDF.
+
+    Paragraph = one text block, merged with the next block when a sentence
+    clearly runs across a column or page break.
+    """
+    info = {"n_pages": 0, "n_blocks": 0, "n_header_footer_blocks": 0, "status": "ok"}
     try:
-        with fitz.open(pdf_path) as doc:
-            for page_num in range(len(doc)):
-                try:
-                    text = doc[page_num].get_textpage().extractText()
-                    for p in text.split("\n\n"):
-                        p = p.strip()
-                        if p and _is_valid_paragraph(p, counters=counters):
-                            paragraphs.append(p)
-                except Exception as e:
-                    logger.warning("Skipping page %d in %s: %s", page_num, pdf_path, e)
-    except fitz.FileDataError as e:
-        logger.error("Corrupted PDF %s: %s", pdf_path, e)
-    except Exception as e:
-        logger.error("Error processing %s: %s", pdf_path, e)
+        doc = fitz.open(pdf_path)
+    except Exception as exc:  # corrupt / encrypted
+        info["status"] = f"unreadable: {type(exc).__name__}"
+        return [], info
 
-    return paragraphs
+    with doc:
+        info["n_pages"] = len(doc)
+        pages: list[list[tuple[float, float, str]]] = []
+        for page in doc:
+            h = page.rect.height or 1.0
+            blocks = []
+            for b in page.get_text("blocks", sort=True):
+                x0, y0, x1, y1, text, _bno, btype = b[:7]
+                if btype != 0 or not text.strip():
+                    continue
+                blocks.append((y0 / h, y1 / h, text))
+            pages.append(blocks)
+
+    info["n_blocks"] = sum(len(p) for p in pages)
+    if info["n_blocks"] == 0:
+        info["status"] = "no_text_layer"  # likely a scan; needs OCR
+        return [], info
+
+    # Running headers/footers: blocks whose digit-normalised text repeats on
+    # many pages of this document.
+    n_pages = len(pages)
+    key_pages = Counter()
+    for p in pages:
+        for k in {_header_key(normalise_block(t)) for _, _, t in p}:
+            key_pages[k] += 1
+    repeated = (
+        {k for k, n in key_pages.items() if n >= max(3, cfg.HEADER_FOOTER_MIN_PAGE_SHARE * n_pages)}
+        if n_pages >= 4
+        else set()
+    )
+
+    paragraphs: list[dict] = []
+    pending: dict | None = None
+    in_skip_section = False
+
+    for page_no, blocks in enumerate(pages, start=1):
+        for top, bottom, raw in blocks:
+            text = normalise_block(raw)
+            if not text:
+                continue
+            key = _header_key(text)
+            if key in repeated:
+                info["n_header_footer_blocks"] += 1
+                continue
+            # Section headings that start a reference list / acronym list.
+            # Everything after is skipped until a long prose block appears.
+            if _SECTION_STOP.match(text.strip(" :.").lower()):
+                in_skip_section = True
+                fc.hit("section_heading_refs_or_acronyms")
+                continue
+            # Bare page numbers / short margin text
+            if (top < 0.06 or bottom > 0.94) and len(text.split()) <= 12:
+                info["n_header_footer_blocks"] += 1
+                continue
+            # Table-of-contents lines
+            if _TOC_LINE.search(raw.strip()):
+                fc.hit("table_of_contents")
+                continue
+            if in_skip_section:
+                # A long prose block ends the skip (annex content after references).
+                if len(text.split()) >= 40 and not _REF_SIGNALS.search(text):
+                    in_skip_section = False
+                else:
+                    fc.hit("in_refs_or_acronym_section")
+                    continue
+
+            # Merge with the previous block if the sentence runs on: the previous
+            # block has no closing punctuation and either the next block starts
+            # lowercase or the previous block is too long to be a heading.
+            if pending and not _ends_sentence(pending["text"]) and (
+                text[:1].islower() or len(pending["text"].split()) >= 12
+            ):
+                pending["text"] += " " + text
+                continue
+            if pending:
+                paragraphs.append(pending)
+            pending = {"page": page_no, "text": text}
+    if pending:
+        paragraphs.append(pending)
+
+    return paragraphs, info
 
 
-def _extract_year_from_filename(filename: str) -> str:
-    """Extract year from filenames like ``document_YYYY-MM-DD_XXX.pdf``."""
-    match = re.search(r"document_(\d{4})-", filename)
-    return match.group(1) if match else ""
+def _md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def extract_text_from_pdfs(pdf_dir: str, output_csv: str, batch_size: int = 50) -> None:
+# ---------------------------------------------------------------------------
+# Optional DEC metadata
+# ---------------------------------------------------------------------------
+
+_DOCTYPE_GUESSES = ["Bibtype_Name", "bibtype_name", "Document Type", "document_type", "Bibtype", "Type"]
+_COUNTRY_GUESSES = ["Country", "country", "Geographic_Area", "Geography", "Countries", "Primary_Country"]
+_FILE_GUESSES = ["filename", "file_name", "File", "pdf", "local_filename"]
+
+
+def _pick(cols: list[str], explicit: str | None, guesses: list[str]) -> str | None:
+    if explicit:
+        return explicit if explicit in cols else None
+    for g in guesses:
+        if g in cols:
+            return g
+    return None
+
+
+def load_metadata(path: str | None) -> pd.DataFrame | None:
+    """Load the DEC export and return columns: filename, doc_type, country (where available)."""
+    if not path:
+        return None
+    meta = pd.read_csv(path, dtype=str, low_memory=False)
+    cols = list(meta.columns)
+    fcol = _pick(cols, cfg.META_FILENAME_COL, _FILE_GUESSES)
+    if fcol is None:
+        logger.warning(
+            "Metadata CSV has no filename column I recognise (%s). Set META_FILENAME_COL.", cols
+        )
+        return None
+    out = pd.DataFrame({"filename": meta[fcol].astype(str).str.strip()})
+    dcol = _pick(cols, cfg.META_DOCTYPE_COL, _DOCTYPE_GUESSES)
+    ccol = _pick(cols, cfg.META_COUNTRY_COL, _COUNTRY_GUESSES)
+    out["doc_type"] = meta[dcol].fillna("Unknown") if dcol else "Unknown"
+    out["country"] = meta[ccol].fillna("Unknown") if ccol else "Unknown"
+    logger.info("Metadata: filename=%s doc_type=%s country=%s", fcol, dcol, ccol)
+    return out.drop_duplicates("filename")
+
+
+# ---------------------------------------------------------------------------
+# Corpus driver
+# ---------------------------------------------------------------------------
+
+def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None) -> None:
     """
-    Full OCR pipeline: iterate over PDFs, extract paragraphs, write CSV.
-
-    This is the main entry point for **stage 1** of the pipeline.
+    Writes to out_dir:
+      chunks.csv          one row per chunk (the unit that gets embedded)
+      documents.csv       one row per kept document, with date/admin/metadata
+      manifest.csv        every PDF seen: md5, status, counts (archive this)
+      filter_counts.csv   paragraphs removed by each rule
     """
-    logger.info("Starting PDF extraction from %s …", pdf_dir)
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdfs = sorted(p for p in Path(pdf_dir).rglob("*") if p.suffix.lower() == ".pdf")
+    logger.info("Found %d PDFs under %s", len(pdfs), pdf_dir)
 
-    counters = {
-        "table_of_contents": 0, "acronyms": 0, "non_latin": 0,
-        "short_paragraph": 0, "too_many_numbers": 0, "all_caps": 0,
-        "references": 0, "unwanted_language": 0,
-    }
+    fc = FilterCounts()
+    manifest, chunk_rows, seen_md5 = [], [], {}
 
-    pdf_files = [f for f in os.listdir(pdf_dir) if f.endswith(".pdf")]
+    for pdf in tqdm(pdfs, desc="Extracting"):
+        md5 = _md5(pdf)
+        d = date_from_filename(pdf.name)
+        row = {
+            "filename": pdf.name,
+            "relpath": str(pdf.relative_to(pdf_dir)),
+            "md5": md5,
+            "date": d.isoformat() if d else "",
+            "administration": administration_for(d),
+        }
+        if md5 in seen_md5:
+            row.update(status=f"duplicate_of:{seen_md5[md5]}", n_pages=0, n_paragraphs=0, n_chunks=0)
+            manifest.append(row)
+            continue
+        seen_md5[md5] = pdf.name
 
-    # Write header
-    with open(output_csv, "w", newline="", encoding="utf-8") as fh:
-        csv.writer(fh).writerow(["filename", "year", "text"])
+        paras, info = extract_paragraphs(pdf, fc)
+        kept = [p for p in paras if keep_paragraph(p["text"], fc)]
+        doc_id = len(seen_md5) - 1
+        n_chunks = 0
+        for p_idx, p in enumerate(kept):
+            for c_idx, chunk in enumerate(chunk_paragraph(p["text"])):
+                chunk_rows.append({
+                    "doc_id": doc_id,
+                    "filename": pdf.name,
+                    "page": p["page"],
+                    "para_idx": p_idx,
+                    "chunk_idx": c_idx,
+                    "n_words": len(chunk.split()),
+                    "text": chunk,
+                })
+                n_chunks += 1
 
-    # Process in batches
-    for i in range(0, len(pdf_files), batch_size):
-        batch = pdf_files[i : i + batch_size]
-        with tqdm(batch, desc=f"Batch {i // batch_size + 1}") as pbar:
-            for pdf_file in pbar:
-                pdf_path = os.path.join(pdf_dir, pdf_file)
-                try:
-                    year = _extract_year_from_filename(pdf_file)
-                    paragraphs = _extract_paragraphs_from_pdf(pdf_path, counters)
-                    if paragraphs:
-                        with open(output_csv, "a", newline="", encoding="utf-8") as fh:
-                            writer = csv.writer(fh)
-                            for p in paragraphs:
-                                writer.writerow([pdf_file, year, p])
-                except Exception as e:
-                    logger.error("Error processing %s: %s", pdf_path, e)
+        status = info["status"]
+        if status == "ok" and n_chunks == 0:
+            status = "no_usable_text"
+        row.update(
+            doc_id=doc_id, status=status, n_pages=info["n_pages"],
+            n_header_footer_blocks=info["n_header_footer_blocks"],
+            n_paragraphs=len(kept), n_chunks=n_chunks,
+        )
+        manifest.append(row)
 
-    logger.info("PDF extraction complete.")
-    for reason, count in counters.items():
-        logger.info("  Skipped (%s): %d", reason, count)
+    manifest_df = pd.DataFrame(manifest)
+    manifest_df.to_csv(out_dir / "manifest.csv", index=False)
+
+    chunks = pd.DataFrame(chunk_rows)
+    docs = manifest_df[(manifest_df["status"] == "ok")].copy()
+    docs = docs[["doc_id", "filename", "md5", "date", "administration", "n_pages", "n_paragraphs", "n_chunks"]]
+    docs["doc_id"] = docs["doc_id"].astype(int)
+
+    meta = load_metadata(metadata_csv)
+    if meta is not None:
+        docs = docs.merge(meta, on="filename", how="left")
+        missing = docs["doc_type"].isna().sum()
+        if missing:
+            logger.warning("%d documents had no metadata match", missing)
+        docs[["doc_type", "country"]] = docs[["doc_type", "country"]].fillna("Unknown")
+    else:
+        docs["doc_type"] = "Unknown"
+        docs["country"] = "Unknown"
+
+    # Keep only chunks from usable documents
+    chunks = chunks[chunks["doc_id"].isin(docs["doc_id"])].reset_index(drop=True)
+    chunks.insert(0, "chunk_id", range(len(chunks)))
+
+    chunks.to_csv(out_dir / "chunks.csv", index=False)
+    docs.to_csv(out_dir / "documents.csv", index=False)
+    pd.DataFrame(sorted(fc.counts.items()), columns=["rule", "paragraphs_removed"]).to_csv(
+        out_dir / "filter_counts.csv", index=False
+    )
+
+    logger.info("Manifest status counts:\n%s", manifest_df["status"].value_counts().to_string())
+    logger.info("Documents kept by administration:\n%s", docs["administration"].value_counts().to_string())
+    logger.info(
+        "Chunks: %d | median words %.0f | docs %d",
+        len(chunks), chunks["n_words"].median() if len(chunks) else 0, len(docs),
+    )

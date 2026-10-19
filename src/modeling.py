@@ -1,287 +1,479 @@
 """
-BERTopic model training with guided seed topics and OpenAI-based labeling.
+Stage 3/4: guided dimensionality reduction, clustering, and topic representation.
 
-Encapsulates all model configuration, seed topic definitions, and the
-fit-transform pipeline (stage 2).
+The pipeline is written out explicitly instead of hidden inside BERTopic's
+fit_transform, so each step can be cached, swept, and described in the paper:
+
+1. (optional) Guided step. Same rule BERTopic uses for seed_topic_list: each
+   chunk is matched to its most similar seed topic (or to the corpus mean, in
+   which case it is left unlabeled); matched embeddings are nudged 25% toward
+   the seed, and the seed labels are given to UMAP as a semi-supervised target.
+2. UMAP to 5 dimensions.
+3. KMeans with a fixed seed and n_init=10. No automatic topic merging
+   (v1's nr_topics="auto" silently merged 50 clusters into 29).
+4. BERTopic is used only for representations (c-TF-IDF keywords plus a
+   KeyBERT-style aspect), fit on the cluster labels we already have.
+   Topic assignments are the fitted labels; nothing is re-predicted with
+   transform() (v1 did, which skipped the guided step).
 """
 
 from __future__ import annotations
 
-import os
-from typing import List, Tuple
+import json
+from pathlib import Path
 
-import openai
-from bertopic import BERTopic
-from bertopic.representation import OpenAI as OpenAIRepresentation
-from bertopic.vectorizers import ClassTfidfTransformer
-from sentence_transformers import SentenceTransformer
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
 from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import CountVectorizer
-from umap import UMAP
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
+from sklearn.preprocessing import normalize
 
 import config as cfg
-from src.preprocessing import get_enhanced_stopwords
 from src.utils import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Seed topics -- domain knowledge for guided modeling
-# ---------------------------------------------------------------------------
-
-SEED_TOPICS: list[list[str]] = [
-    # 1. HIV/AIDS Programs and Implementation
-    ["HIV/AIDS", "PEPFAR", "antiretroviral therapy", "viral suppression", "pre-exposure prophylaxis",
-     "DREAMS initiative", "key populations", "90-90-90 targets", "test and treat", "AIDS-free generation",
-     "UNAIDS", "HIV testing", "ART adherence", "prevention of mother-to-child transmission", "PMTCT"],
-    # 2. Malaria and Vector-Borne Disease Control
-    ["malaria", "President's Malaria Initiative", "PMI", "vector control", "insecticide-treated nets",
-     "indoor residual spraying", "artemisinin-based combination therapy", "rapid diagnostic tests",
-     "integrated vector management", "malaria elimination", "surveillance systems", "entomological monitoring",
-     "drug resistance", "seasonal malaria chemoprevention", "larviciding"],
-
-    # 3. Maternal and Child Health
-    ["maternal health", "child health", "maternal mortality", "newborn care", "childhood immunization",
-     "obstetric care", "kangaroo mother care", "integrated management of childhood illness", "IMCI",
-     "antenatal care", "postnatal care", "skilled birth attendance", "emergency obstetric care",
-     "maternal nutrition", "child survival"],
-
-    # 4. Reproductive Health and Family Planning
-    ["family planning", "contraceptive security", "reproductive health", "unmet need", "birth spacing",
-     "LARC methods", "contraceptive prevalence", "method mix", "reproductive rights",
-     "Demographic Health Surveys",
-     "total fertility rate", "UNFPA", "voluntary family planning", "adolescent reproductive health",
-     "population dynamics", "contraceptive counseling", "unintended pregnancy"],
-
-    # 5. Health Systems Strengthening
-    ["health systems strengthening", "governance", "health workforce", "human resources for health",
-     "supply chain management", "health information systems", "DHIS2", "health financing",
-     "quality improvement",
-     "universal health coverage", "UHC", "district health systems", "public financial management",
-     "community health systems", "resilient health systems", "decentralization"],
-
-    # 6. Global Health Security and Emerging Threats
-    ["global health security", "pandemic preparedness", "disease surveillance", "outbreak response",
-     "International Health Regulations", "One Health approach", "zoonotic diseases", "antimicrobial resistance",
-     "emergency operations centers", "biosafety", "biosecurity", "rapid response teams",
-     "event-based surveillance",
-     "GHSA", "emerging infectious diseases", "biological threats"],
-
-    # 7. COVID-19 Response and Recovery
-    ["COVID-19", "SARS-CoV-2", "vaccine equity", "vaccine hesitancy", "health system resilience",
-     "oxygen supply", "therapeutic treatments", "PPE", "testing capacity", "genomic sequencing",
-     "COVAX facility", "pandemic response", "infection prevention control", "social distancing",
-     "vaccine distribution", "vaccine cold chain", "COVID variants"],
-
-    # 8. Digital Health and Innovation
-    ["digital health", "mHealth", "telemedicine", "electronic medical records", "interoperability",
-     "health management information systems", "geospatial analysis", "artificial intelligence",
-     "digital technologies", "connectivity", "digital literacy", "data protection", "digital solutions",
-     "mobile applications", "remote monitoring", "digital transformation"],
-
-    # 9. Nutrition and Food Security
-    ["nutrition", "stunting", "wasting", "micronutrient deficiencies", "infant and young child feeding",
-     "breastfeeding", "complementary feeding", "food fortification", "Scaling Up Nutrition", "SUN movement",
-     "nutrition-sensitive agriculture", "first 1000 days", "anemia", "nutrition surveillance",
-     "food security", "malnutrition treatment", "RUTF"],
-
-    # 10. Water, Sanitation, and Hygiene
-    ["WASH", "water security", "sanitation", "hygiene", "water quality", "open defecation",
-     "handwashing", "water treatment", "community-led total sanitation", "CLTS", "menstrual hygiene",
-     "water point sustainability", "safely managed services", "WASH in healthcare facilities",
-     "water resource management", "water access", "sanitation marketing"],
-
-    # 11. Tuberculosis Prevention and Control
-    ["tuberculosis", "TB", "drug-resistant tuberculosis", "MDR-TB", "DOTS", "GeneXpert", "TB case finding",
-     "TB preventive therapy", "isoniazid preventive therapy", "TB diagnosis", "contact tracing",
-     "TB/HIV co-infection",
-     "treatment success rate", "latent TB infection", "TB infection control", "national TB programs"],
-
-    # 12. Health Equity, Gender, and Vulnerable Populations
-    ["health equity", "gender equality", "gender-based violence", "marginalized populations",
-     "disability inclusion",
-     "LGBTQ+ health", "social determinants of health", "indigenous health", "adolescent health",
-     "women's empowerment",
-     "gender analysis", "gender integration", "youth engagement", "equity analysis", "inclusive programming",
-     "intersectionality"],
-
-    # 13. Private Sector Engagement and Health Financing
-    ["private sector engagement", "public-private partnerships", "domestic resource mobilization",
-     "health financing",
-     "health insurance", "results-based financing", "social health insurance", "financial protection",
-     "blended finance",
-     "corporate social responsibility", "social entrepreneurship", "market-based solutions",
-     "sustainability planning",
-     "total market approach", "financial sustainability", "revenue generation"],
-
-    # 14. Community Health Systems and Community Health Workers
-    ["community health workers", "CHWs", "community-based services", "task shifting", "community engagement",
-     "community health strategy", "village health teams", "community case management", "community mobilization",
-     "community platforms", "integrated community case management", "iCCM", "peer educators",
-     "community health committees",
-     "community participation", "last mile health services", "CHW incentives"],
-
-    # 15. Health Policy, Governance and Leadership
-    ["health policy", "governance", "strategic planning", "health legislation", "regulatory frameworks",
-     "accountability", "transparency", "policy dialogue", "stakeholder engagement",
-     "evidence-based policymaking",
-     "policy implementation", "health systems governance", "leadership development",
-     "institutional capacity building",
-     "country ownership", "sustainability planning", "transition planning"],
-
-    # 16. Climate Change and Environmental Health
-    ["climate change", "environmental health", "climate resilience", "climate adaptation",
-     "vector distribution",
-     "extreme weather events", "heat-related illness", "air pollution", "climate-sensitive diseases",
-     "planetary health", "climate vulnerabilities", "climate mitigation", "climate-smart healthcare",
-     "environmental determinants", "eco-health", "climate risk assessment", "One Health"],
-
-    # 17. Neglected Tropical Diseases
-    ["neglected tropical diseases", "NTDs", "mass drug administration", "lymphatic filariasis",
-     "schistosomiasis",
-     "trachoma", "soil-transmitted helminths", "onchocerciasis", "disease mapping", "preventive chemotherapy",
-     "morbidity management", "disability prevention", "NTD elimination", "water-related diseases",
-     "vector control", "integrated NTD control", "surveillance and response"],
-
-    # 18. Non-Communicable Diseases and Mental Health
-    ["non-communicable diseases", "NCDs", "cardiovascular disease", "diabetes", "chronic respiratory diseases",
-     "cancer", "mental health", "risk factors", "NCD prevention", "tobacco control", "alcohol abuse",
-     "physical activity", "healthy diets", "health promotion", "integrated services",
-     "mental health integration",
-     "depression", "anxiety disorders", "psychological first aid", "trauma-informed care"]
-]
-
 
 # ---------------------------------------------------------------------------
-# Prompt template for OpenAI-based topic labeling
+# Seed topics (Appendix D, de-duplicated)
 # ---------------------------------------------------------------------------
+# v1 repeated several terms across topics ("governance", "health financing",
+# "vector control", "One Health", "sustainability planning"), which pulls the
+# same chunk toward two seeds. Each term now lives in exactly one topic.
 
-LABEL_PROMPT = """<|system|> You are an expert in topic modeling and global health policy, trained to create concise and accurate topic labels. Your goal is to generate the **most informative and specific** topic label possible based on the provided documents and keywords. </s>
+SEED_TOPICS: dict[str, list[str]] = {
+    "HIV/AIDS": [
+        "HIV/AIDS", "PEPFAR", "antiretroviral therapy", "viral suppression", "pre-exposure prophylaxis",
+        "DREAMS initiative", "key populations", "95-95-95 targets", "test and treat", "AIDS-free generation",
+        "UNAIDS", "HIV testing", "ART adherence", "prevention of mother-to-child transmission", "PMTCT",
+    ],
+    "Malaria": [
+        "malaria", "President's Malaria Initiative", "PMI", "vector control", "insecticide-treated nets",
+        "indoor residual spraying", "artemisinin-based combination therapy", "rapid diagnostic tests",
+        "integrated vector management", "malaria elimination", "entomological monitoring",
+        "antimalarial drug resistance", "seasonal malaria chemoprevention", "larviciding",
+    ],
+    "Maternal and child health": [
+        "maternal health", "child health", "maternal mortality", "newborn care", "childhood immunization",
+        "obstetric care", "kangaroo mother care", "integrated management of childhood illness", "IMCI",
+        "antenatal care", "postnatal care", "skilled birth attendance", "emergency obstetric care",
+        "maternal nutrition", "child survival",
+    ],
+    "Family planning and reproductive health": [
+        "family planning", "contraceptive security", "reproductive health", "unmet need", "birth spacing",
+        "LARC methods", "contraceptive prevalence", "method mix", "reproductive rights",
+        "Demographic and Health Surveys", "total fertility rate", "UNFPA", "voluntary family planning",
+        "adolescent reproductive health", "population dynamics", "contraceptive counseling",
+        "unintended pregnancy",
+    ],
+    "Health systems strengthening": [
+        "health systems strengthening", "health workforce", "human resources for health",
+        "supply chain management", "health information systems", "DHIS2", "quality improvement",
+        "universal health coverage", "UHC", "district health systems", "public financial management",
+        "resilient health systems", "decentralization",
+    ],
+    "Global health security": [
+        "global health security", "pandemic preparedness", "disease surveillance", "outbreak response",
+        "International Health Regulations", "One Health approach", "zoonotic diseases",
+        "antimicrobial resistance", "emergency operations centers", "biosafety", "biosecurity",
+        "rapid response teams", "event-based surveillance", "GHSA", "emerging infectious diseases",
+        "biological threats",
+    ],
+    "COVID-19": [
+        "COVID-19", "SARS-CoV-2", "vaccine equity", "vaccine hesitancy", "oxygen supply",
+        "COVID-19 therapeutics", "PPE", "testing capacity", "genomic sequencing", "COVAX facility",
+        "pandemic response", "infection prevention and control", "social distancing",
+        "vaccine distribution", "vaccine cold chain", "COVID variants",
+    ],
+    "Digital health": [
+        "digital health", "mHealth", "telemedicine", "electronic medical records", "interoperability",
+        "health management information systems", "geospatial analysis", "artificial intelligence",
+        "digital technologies", "connectivity", "digital literacy", "data protection",
+        "mobile applications", "remote monitoring", "digital transformation",
+    ],
+    "Nutrition": [
+        "nutrition", "stunting", "wasting", "micronutrient deficiencies", "infant and young child feeding",
+        "breastfeeding", "complementary feeding", "food fortification", "Scaling Up Nutrition",
+        "SUN movement", "nutrition-sensitive agriculture", "first 1000 days", "anemia",
+        "nutrition surveillance", "food security", "malnutrition treatment", "RUTF",
+    ],
+    "WASH": [
+        "WASH", "water security", "sanitation", "hygiene", "water quality", "open defecation",
+        "handwashing", "water treatment", "community-led total sanitation", "CLTS", "menstrual hygiene",
+        "water point sustainability", "safely managed services", "WASH in healthcare facilities",
+        "water access", "sanitation marketing",
+    ],
+    "Tuberculosis": [
+        "tuberculosis", "TB", "drug-resistant tuberculosis", "MDR-TB", "DOTS", "GeneXpert",
+        "TB case finding", "TB preventive therapy", "isoniazid preventive therapy", "TB diagnosis",
+        "contact investigation", "TB/HIV co-infection", "treatment success rate", "latent TB infection",
+        "TB infection control", "national TB programs",
+    ],
+    "Equity, gender, and vulnerable populations": [
+        "health equity", "gender equality", "gender-based violence", "marginalized populations",
+        "disability inclusion", "LGBTQI+ health", "social determinants of health", "indigenous health",
+        "adolescent health", "women's empowerment", "gender analysis", "gender integration",
+        "youth engagement", "inclusive programming", "intersectionality",
+    ],
+    "Private sector and health financing": [
+        "private sector engagement", "public-private partnerships", "domestic resource mobilization",
+        "health financing", "health insurance", "results-based financing", "social health insurance",
+        "financial protection", "blended finance", "corporate social responsibility",
+        "social entrepreneurship", "market-based solutions", "total market approach",
+        "financial sustainability", "revenue generation",
+    ],
+    "Community health": [
+        "community health workers", "CHWs", "community-based services", "task shifting",
+        "community engagement", "community health strategy", "village health teams",
+        "community case management", "community mobilization", "integrated community case management",
+        "iCCM", "peer educators", "community health committees", "community participation",
+        "last mile health services", "community health systems",
+    ],
+    "Health policy, governance, and leadership": [
+        "health policy", "governance", "strategic planning", "health legislation", "regulatory frameworks",
+        "accountability", "transparency", "policy dialogue", "stakeholder engagement",
+        "evidence-based policymaking", "policy implementation", "health systems governance",
+        "leadership development", "institutional capacity building", "country ownership",
+        "sustainability planning", "transition planning",
+    ],
+    "Climate and environmental health": [
+        "climate change", "environmental health", "climate resilience", "climate adaptation",
+        "extreme weather events", "heat-related illness", "air pollution", "climate-sensitive diseases",
+        "planetary health", "climate mitigation", "climate-smart healthcare", "environmental determinants",
+        "climate risk assessment",
+    ],
+    "Neglected tropical diseases": [
+        "neglected tropical diseases", "NTDs", "mass drug administration", "lymphatic filariasis",
+        "schistosomiasis", "trachoma", "soil-transmitted helminths", "onchocerciasis", "disease mapping",
+        "preventive chemotherapy", "morbidity management and disability prevention", "NTD elimination",
+        "integrated NTD control",
+    ],
+    "NCDs and mental health": [
+        "non-communicable diseases", "NCDs", "cardiovascular disease", "diabetes",
+        "chronic respiratory diseases", "cancer", "mental health", "NCD prevention", "tobacco control",
+        "alcohol use", "physical activity", "healthy diets", "mental health integration", "depression",
+        "anxiety disorders", "psychological first aid", "trauma-informed care",
+    ],
+}
 
-<|user|>
-I have a topic that contains the following documents:
-[DOCUMENTS]
 
-The topic is described by the following keywords: '[KEYWORDS]'.
+def _check_seed_overlap() -> None:
+    seen: dict[str, str] = {}
+    for topic, terms in SEED_TOPICS.items():
+        for t in terms:
+            key = t.lower()
+            if key in seen:
+                raise ValueError(f"Seed term '{t}' appears in both '{seen[key]}' and '{topic}'")
+            seen[key] = topic
 
-Please generate a **concise topic label** (5 words or fewer) that best represents the theme of this topic. The label should be **specific, professional, and relevant to global health and international development**.  
 
-If the topic is **unclear** based on the documents and keywords, return a **general but accurate** category instead (e.g., "Health Policy Trends" or "Global Health Financing").  
-
-**Only return the topic label—no explanations, extra text, or formatting.** </s>  
-<|assistant|>"""
+_check_seed_overlap()
 
 
 # ---------------------------------------------------------------------------
-# Model building
+# Vocabulary / stopwords (affect keywords only, never cluster assignment)
 # ---------------------------------------------------------------------------
 
-def build_topic_model() -> BERTopic:
+def get_stopwords() -> list[str]:
     """
-    Construct a fully configured BERTopic model ready for fitting.
+    Single-token stopwords for the c-TF-IDF vocabulary.
 
-    All hyperparameters come from ``config.py`` so they can be tuned without
-    touching this module.
+    These change which keywords describe a topic. They do not change which
+    topic a chunk is assigned to (that is decided on embeddings). Multi-word
+    entries are omitted because CountVectorizer ignores them. Bare numbers are
+    excluded by the token pattern instead of being listed.
     """
-    if not cfg.OPENAI_API_KEY:
-        raise EnvironmentError(
-            "OPENAI_API_KEY is not set. "
-            "Copy .env.example to .env and add your key."
-        )
+    publication = """prepared publication suggested citation isbn report reports washington dc
+        official views positions contents executive summary background overview methodology
+        appendix annex page pages section chapter paragraph figure table reference references
+        bibliography footnote note volume https www usaid gov org pdf disclaimer""".split()
+    time_terms = """january february march april may june july august september october november
+        december jan feb mar apr jun jul aug sep sept oct nov dec month months monthly quarter
+        quarters quarterly annual annually year years fiscal fy""".split()
+    time_terms += [f"fy{y}" for y in range(10, 30)] + [f"fy20{y}" for y in range(10, 30)]
+    fragments = """de la les en des et le du para dan pa za ke tes wa ts ee tr ea ti te ie io ro sb
+        fn aa uo ye na tbd ii iii iv vi vii viii ix xi xii""".split()
+    # v1 also removed "budget", "procurement", "outreach", "implemented": those carry policy
+    # meaning and are kept now. reduce_frequent_words=True handles generic high-frequency terms.
+    generic = """total number percent frequency details questionnaire respondents""".split()
+    return sorted(set(ENGLISH_STOP_WORDS) | set(publication) | set(time_terms) | set(fragments) | set(generic))
 
-    client = openai.OpenAI(api_key=cfg.OPENAI_API_KEY)
 
-    umap_model = UMAP(
+def make_vectorizer(ngram_range=cfg.VECTORIZER_NGRAM_RANGE, binary=False, min_df=cfg.VECTORIZER_MIN_DF,
+                    max_df=cfg.VECTORIZER_MAX_DF):
+    """
+    min_df/max_df here count *chunks* (TermMatrices fits on chunks).
+
+    Careful: BERTopic fits its vectorizer on one concatenated document per
+    topic, so inside BERTopic min_df counts *topics*. v1 passed min_df=20 to
+    BERTopic, which kept only words that appear in at least 20 topics and
+    threw away the distinctive ones. The BERTopic-side vectorizer below uses
+    min_df=1, max_df=1.0 for that reason.
+    """
+    return CountVectorizer(
+        stop_words=get_stopwords(),
+        ngram_range=ngram_range,
+        min_df=min_df,
+        max_df=max_df,
+        token_pattern=cfg.VECTORIZER_TOKEN_PATTERN,
+        lowercase=True,
+        binary=binary,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Guided step + UMAP
+# ---------------------------------------------------------------------------
+
+def guided_labels(embeddings: np.ndarray, embedding_model) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reproduce BERTopic's guided-topic rule explicitly.
+
+    Returns (y, nudged_embeddings). y[i] = seed index, or -1 when the chunk is
+    closer to the corpus mean than to any seed (unlabeled for UMAP).
+    """
+    seed_texts = [", ".join(terms) for terms in SEED_TOPICS.values()]
+    seed_emb = embedding_model.encode(seed_texts, normalize_embeddings=True, convert_to_numpy=True)
+    targets = np.vstack([seed_emb, embeddings.mean(axis=0, keepdims=True)])
+    targets = normalize(targets)
+    sims = embeddings @ targets.T  # embeddings are already L2-normalised
+    y = sims.argmax(axis=1)
+    y[y == len(seed_texts)] = -1
+
+    nudged = embeddings.copy()
+    for s in range(len(seed_texts)):
+        m = y == s
+        nudged[m] = 0.75 * nudged[m] + 0.25 * seed_emb[s]
+    return y.astype(int), nudged
+
+
+def reduce_dimensions(embeddings: np.ndarray, y: np.ndarray | None, seed: int) -> np.ndarray:
+    from umap import UMAP
+
+    reducer = UMAP(
         n_neighbors=cfg.UMAP_N_NEIGHBORS,
         n_components=cfg.UMAP_N_COMPONENTS,
         min_dist=cfg.UMAP_MIN_DIST,
-        spread=cfg.UMAP_SPREAD,
-        metric="cosine",
-        random_state=42,
-        low_memory=False,
+        metric=cfg.UMAP_METRIC,
+        random_state=seed,
+        low_memory=True,
+        verbose=True,
     )
+    return reducer.fit_transform(embeddings, y=y)
 
-    cluster_model = KMeans(n_clusters=cfg.KMEANS_N_CLUSTERS)
 
-    vectorizer_model = CountVectorizer(
-        stop_words=get_enhanced_stopwords(),
-        ngram_range=cfg.VECTORIZER_NGRAM_RANGE,
-        min_df=cfg.VECTORIZER_MIN_DF,
-        max_df=cfg.VECTORIZER_MAX_DF,
-    )
+def get_reduced(data_dir: Path, embeddings: np.ndarray, seed: int, seeded: bool, embedding_model=None) -> np.ndarray:
+    """UMAP output for (seed, seeded), cached on disk."""
+    cache = data_dir / "umap_cache"
+    cache.mkdir(exist_ok=True)
+    path = cache / f"{'seeded' if seeded else 'unseeded'}_seed{seed}_nn{cfg.UMAP_N_NEIGHBORS}_d{cfg.UMAP_N_COMPONENTS}.npy"
+    if path.exists():
+        red = np.load(path)
+        if red.shape[0] == embeddings.shape[0]:
+            logger.info("Loaded cached UMAP %s", path.name)
+            return red
+    if seeded:
+        if embedding_model is None:
+            from src.embedding import load_embedding_model
 
-    representation_model = OpenAIRepresentation(
-        client, model=cfg.OPENAI_MODEL,
-        prompt=LABEL_PROMPT, delay_in_seconds=cfg.OPENAI_DELAY, chat=True,
-    )
+            embedding_model = load_embedding_model()
+        y, emb_in = guided_labels(embeddings, embedding_model)
+        logger.info(
+            "Guided step: %.1f%% of chunks matched a seed topic",
+            100 * (y >= 0).mean(),
+        )
+        np.save(cache / "guided_seed_labels.npy", y)
+    else:
+        y, emb_in = None, embeddings
+    logger.info("Fitting UMAP (seed=%d, seeded=%s) on %d x %d ...", seed, seeded, *emb_in.shape)
+    red = reduce_dimensions(emb_in, y, seed)
+    np.save(path, red)
+    return red
+
+
+def cluster(reduced: np.ndarray, k: int, seed: int) -> np.ndarray:
+    return KMeans(n_clusters=k, n_init=cfg.KMEANS_N_INIT, random_state=seed).fit_predict(reduced)
+
+
+# ---------------------------------------------------------------------------
+# Fast c-TF-IDF + coherence (used by the sweep and the final report)
+# ---------------------------------------------------------------------------
+
+class TermMatrices:
+    """Count matrices built once and reused for every (k, seed) in the sweep."""
+
+    def __init__(self, texts: list[str]):
+        self.vec = make_vectorizer()
+        self.X = self.vec.fit_transform(texts).tocsr()
+        self.vocab = np.array(self.vec.get_feature_names_out())
+        self.is_unigram = np.array([" " not in w for w in self.vocab])
+        # Binary unigram document-term matrix for NPMI
+        self.Xb = (self.X[:, np.where(self.is_unigram)[0]] > 0).astype(np.float32).tocsc()
+        self.uni_index = {w: i for i, w in enumerate(self.vocab[self.is_unigram])}
+        self.doc_freq = np.asarray(self.Xb.sum(axis=0)).ravel()
+        self.n_docs = self.Xb.shape[0]
+        logger.info("Vocabulary: %d terms (%d unigrams)", len(self.vocab), self.is_unigram.sum())
+
+    def ctfidf(self, labels: np.ndarray, k: int) -> np.ndarray:
+        """BERTopic's c-TF-IDF with reduce_frequent_words=True. Returns dense (k x V)."""
+        onehot = sp.csr_matrix((np.ones(len(labels)), (labels, np.arange(len(labels)))), shape=(k, len(labels)))
+        T = (onehot @ self.X).astype(np.float64)
+        df = np.asarray(T.sum(axis=0)).ravel()
+        avg = T.sum() / k
+        idf = np.log(avg / np.maximum(df, 1) + 1)
+        T = normalize(T, norm="l1", axis=1)
+        T.data = np.sqrt(T.data)
+        return (T @ sp.diags(idf)).toarray()
+
+    def top_words(self, scores: np.ndarray, n: int = cfg.N_TOP_WORDS, unigram_only: bool = False) -> list[list[str]]:
+        out = []
+        for row in scores:
+            order = np.argsort(-row)
+            if unigram_only:
+                order = order[self.is_unigram[order]]
+            out.append([self.vocab[i] for i in order[:n] if row[i] > 0])
+        return out
+
+    def npmi(self, words: list[str]) -> float:
+        idx = [self.uni_index[w] for w in words if w in self.uni_index]
+        if len(idx) < 2:
+            return np.nan
+        sub = self.Xb[:, idx]
+        co = (sub.T @ sub).toarray() / self.n_docs
+        p = np.diag(co).copy()
+        vals = []
+        eps = 1e-12
+        for i in range(len(idx)):
+            for j in range(i + 1, len(idx)):
+                pij = co[i, j]
+                if pij <= 0:
+                    vals.append(-1.0)
+                    continue
+                pmi = np.log((pij + eps) / (p[i] * p[j] + eps))
+                vals.append(pmi / -np.log(pij + eps))
+        return float(np.mean(vals))
+
+
+def topic_diversity(word_lists: list[list[str]]) -> float:
+    words = [w for ws in word_lists for w in ws]
+    return len(set(words)) / max(len(words), 1)
+
+
+def concentration(labels: np.ndarray, doc_ids: np.ndarray, k: int) -> pd.DataFrame:
+    """Per topic: chunks, distinct documents, and share supplied by the single largest document."""
+    df = pd.DataFrame({"topic": labels, "doc_id": doc_ids})
+    g = df.groupby(["topic", "doc_id"]).size().rename("n").reset_index()
+    rows = []
+    for t in range(k):
+        sub = g[g["topic"] == t]
+        n = sub["n"].sum()
+        rows.append({
+            "topic": t,
+            "n_chunks": int(n),
+            "n_docs": int(len(sub)),
+            "top_doc_id": int(sub.loc[sub["n"].idxmax(), "doc_id"]) if n else -1,
+            "top_doc_share": float(sub["n"].max() / n) if n else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Final model
+# ---------------------------------------------------------------------------
+
+def fit_representations(texts: list[str], embeddings: np.ndarray, labels: np.ndarray, embedding_model):
+    """
+    Fit BERTopic on precomputed cluster labels, only to get topic representations.
+    Main = c-TF-IDF keywords; KeyBERT = embedding-based keyword aspect.
+    """
+    from bertopic import BERTopic
+    from bertopic.cluster import BaseCluster
+    from bertopic.dimensionality import BaseDimensionalityReduction
+    from bertopic.representation import KeyBERTInspired
+    from bertopic.vectorizers import ClassTfidfTransformer
 
     topic_model = BERTopic(
+        embedding_model=embedding_model,
+        umap_model=BaseDimensionalityReduction(),
+        hdbscan_model=BaseCluster(),
+        vectorizer_model=make_vectorizer(min_df=1, max_df=1.0),  # topic-level counts; see make_vectorizer
+        ctfidf_model=ClassTfidfTransformer(reduce_frequent_words=True),
+        representation_model={"KeyBERT": KeyBERTInspired(random_state=cfg.RANDOM_SEED)},
+        top_n_words=cfg.N_TOP_WORDS,
+        nr_topics=None,
+        calculate_probabilities=False,
         verbose=True,
-        representation_model=representation_model,
-        nr_topics=cfg.NR_TOPICS,
-        min_topic_size=cfg.MIN_TOPIC_SIZE,
-        hdbscan_model=cluster_model,
-        vectorizer_model=vectorizer_model,
-        ctfidf_model=ClassTfidfTransformer(reduce_frequent_words=False),
-        embedding_model=SentenceTransformer(cfg.EMBEDDING_MODEL_NAME),
-        umap_model=umap_model,
-        seed_topic_list=SEED_TOPICS,
-        calculate_probabilities=True,
-        language="english",
     )
-
-    logger.info("BERTopic model built with %d seed topics", len(SEED_TOPICS))
+    topic_model.fit(texts, embeddings=embeddings, y=labels)
     return topic_model
 
 
-def train_and_save(
-    documents: List[str],
-    timestamps: List[int],
-    administrations: List[str],
-    output_dir: str,
-) -> Tuple[BERTopic, list, list]:
-    """
-    Build, fit, visualize, and persist a BERTopic model.
+LABEL_SYSTEM = (
+    "You label topics from a topic model of USAID global health documents. "
+    "Return a short, literal label (at most 6 words) describing what the passages are about. "
+    "Name a country or program only if nearly all passages share it. "
+    "Do not infer policy intent or significance. Return only the label."
+)
 
-    Returns (topic_model, topics, probs).
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    topic_model = build_topic_model()
 
-    logger.info("Fitting BERTopic model on %d documents ...", len(documents))
-    topics, probs = topic_model.fit_transform(documents)
+def gpt_labels(topic_model, n_docs: int = 5) -> dict[int, str]:
+    """Optional human-readable labels. Display only: never used for any metric."""
+    if not cfg.OPENAI_API_KEY:
+        logger.info("OPENAI_API_KEY not set; skipping GPT labels.")
+        return {}
+    import openai
 
-    # ----- Save core artifacts -----
-    topic_info = topic_model.get_topic_info()
-    topic_info.to_csv(os.path.join(output_dir, "topic_info.csv"), index=False)
+    client = openai.OpenAI(api_key=cfg.OPENAI_API_KEY)
+    labels = {}
+    rep_docs = topic_model.get_representative_docs()
+    for t in sorted(topic_model.get_topics()):
+        if t == -1:
+            continue
+        words = ", ".join(w for w, _ in topic_model.get_topic(t))
+        docs = "\n---\n".join(d[:800] for d in rep_docs.get(t, [])[:n_docs])
+        resp = client.chat.completions.create(
+            model=cfg.OPENAI_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": LABEL_SYSTEM},
+                {"role": "user", "content": f"Keywords: {words}\n\nPassages:\n{docs}"},
+            ],
+        )
+        labels[t] = resp.choices[0].message.content.strip().strip('"')
+        logger.info("Topic %d: %s", t, labels[t])
+    return labels
 
-    # Topics over time
-    topics_over_time = topic_model.topics_over_time(
-        documents, timestamps, nr_bins=cfg.TOPICS_OVER_TIME_BINS,
+
+def save_final(out_dir: Path, topic_model, labels: np.ndarray, chunks: pd.DataFrame, docs: pd.DataFrame,
+               terms: TermMatrices, k: int, gpt: dict[int, str]) -> pd.DataFrame:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"chunk_id": chunks["chunk_id"], "doc_id": chunks["doc_id"], "topic": labels}).to_csv(
+        out_dir / "topics.csv", index=False
     )
-    topics_over_time.to_csv(os.path.join(output_dir, "topics_over_time.csv"), index=False)
 
-    # ----- Standard visualizations -----
-    topic_model.visualize_topics_over_time(
-        topics_over_time, top_n_topics=10, width=1200, height=800,
-    ).write_html(os.path.join(output_dir, "topics_over_time.html"))
+    scores = terms.ctfidf(labels, k)
+    words = terms.top_words(scores)
+    uni = terms.top_words(scores, unigram_only=True)
+    conc = concentration(labels, chunks["doc_id"].to_numpy(), k)
+    fname = docs.set_index("doc_id")["filename"]
 
-    topic_model.visualize_topics(
-        width=1200, height=800,
-    ).write_html(os.path.join(output_dir, "topic_network.html"))
+    keybert = {t: [w for w, _ in v] for t, v in topic_model.topic_aspects_.get("KeyBERT", {}).items()}
+    info = conc.copy()
+    info["keywords"] = [", ".join(w) for w in words]
+    info["keybert"] = [", ".join(keybert.get(t, [])) for t in range(k)]
+    info["npmi"] = [terms.npmi(u) for u in uni]
+    info["gpt_label"] = [gpt.get(t, "") for t in range(k)]
+    info["top_doc_filename"] = info["top_doc_id"].map(fname)
+    info["single_doc_dominated"] = info["top_doc_share"] > cfg.SINGLE_DOC_DOMINANCE
+    info["share_of_chunks"] = info["n_chunks"] / info["n_chunks"].sum()
+    info.to_csv(out_dir / "topic_info.csv", index=False)
 
-    topic_model.visualize_hierarchy(
-        width=1200, height=800,
-    ).write_html(os.path.join(output_dir, "topic_hierarchy.html"))
-
-    topic_model.visualize_barchart(
-        top_n_topics=15, n_words=10, width=1200, height=800,
-    ).write_html(os.path.join(output_dir, "topic_barchart.html"))
-
-    # ----- Persist model (remove API client to avoid pickle issues) -----
-    topic_model.representation_model = None
-    model_path = os.path.join(output_dir, "topic_model")
-    topic_model.save(model_path)
-    logger.info("Model saved to %s", model_path)
-
-    return topic_model, topics, probs
+    topic_model.save(
+        str(out_dir / "bertopic_model"),
+        serialization="safetensors",
+        save_ctfidf=True,
+        save_embedding_model=cfg.EMBEDDING_MODEL_NAME,
+    )
+    (out_dir / "seed_topics.json").write_text(json.dumps(SEED_TOPICS, indent=2))
+    return info
