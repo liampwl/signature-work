@@ -30,8 +30,12 @@ Topic-modeling pipeline for comparing USAID global health documents from the fir
 ```bash
 pip install -r requirements.txt
 
+# 0. Map PDF filenames back to the finalized DEC export (document type, geography, DEC ID)
+python scripts/00_build_metadata.py --dec-csv "SW DEC Database finalized jan9.csv" --pdf-dir /path/to/pdfs --out data/dec_metadata.csv
+
 # 1. PDFs -> chunks.csv, documents.csv, manifest.csv (MD5 per file), filter_counts.csv
 python scripts/01_extract_text.py --pdf-dir /path/to/pdfs --data-dir data [--metadata data/dec_metadata.csv]
+#    (add metadata later without re-extracting: --metadata data/dec_metadata.csv --metadata-only)
 
 # 2. Embed once (cached to data/embeddings.npy). A GPU or Apple Silicon (MPS) helps a lot.
 python scripts/02_embed.py --data-dir data

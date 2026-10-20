@@ -318,8 +318,8 @@ def _md5(path: Path) -> str:
 # Optional DEC metadata
 # ---------------------------------------------------------------------------
 
-_DOCTYPE_GUESSES = ["Bibtype_Name", "bibtype_name", "Document Type", "document_type", "Bibtype", "Type"]
-_COUNTRY_GUESSES = ["Country", "country", "Geographic_Area", "Geography", "Countries", "Primary_Country"]
+_DOCTYPE_GUESSES = ["doc_type", "Bibliographic_Type", "Bibtype_Name", "bibtype_name", "Document Type", "document_type", "Bibtype", "Type"]
+_COUNTRY_GUESSES = ["country", "Country", "country", "Geographic_Area", "Geography", "Countries", "Primary_Country"]
 _FILE_GUESSES = ["filename", "file_name", "File", "pdf", "local_filename"]
 
 
@@ -351,6 +351,28 @@ def load_metadata(path: str | None) -> pd.DataFrame | None:
     out["country"] = meta[ccol].fillna("Unknown") if ccol else "Unknown"
     logger.info("Metadata: filename=%s doc_type=%s country=%s", fcol, dcol, ccol)
     return out.drop_duplicates("filename")
+
+
+def _merge_metadata(docs: pd.DataFrame, meta: pd.DataFrame | None) -> pd.DataFrame:
+    docs = docs.drop(columns=[c for c in ("doc_type", "country") if c in docs.columns])
+    if meta is None:
+        docs["doc_type"] = "Unknown"
+        docs["country"] = "Unknown"
+        return docs
+    docs = docs.merge(meta[["filename", "doc_type", "country"]], on="filename", how="left")
+    missing = docs["doc_type"].isna().sum()
+    if missing:
+        logger.warning("%d documents had no metadata match", missing)
+    docs[["doc_type", "country"]] = docs[["doc_type", "country"]].fillna("Unknown")
+    return docs
+
+
+def attach_metadata(data_dir: Path, metadata_csv: str) -> None:
+    """Re-attach DEC metadata to an existing documents.csv without re-extracting."""
+    docs = pd.read_csv(data_dir / "documents.csv")
+    docs = _merge_metadata(docs, load_metadata(metadata_csv))
+    docs.to_csv(data_dir / "documents.csv", index=False)
+    logger.info("Document types:\n%s", docs["doc_type"].value_counts().to_string())
 
 
 # ---------------------------------------------------------------------------
@@ -423,16 +445,7 @@ def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None
     docs = docs[["doc_id", "filename", "md5", "date", "administration", "n_pages", "n_paragraphs", "n_chunks"]]
     docs["doc_id"] = docs["doc_id"].astype(int)
 
-    meta = load_metadata(metadata_csv)
-    if meta is not None:
-        docs = docs.merge(meta, on="filename", how="left")
-        missing = docs["doc_type"].isna().sum()
-        if missing:
-            logger.warning("%d documents had no metadata match", missing)
-        docs[["doc_type", "country"]] = docs[["doc_type", "country"]].fillna("Unknown")
-    else:
-        docs["doc_type"] = "Unknown"
-        docs["country"] = "Unknown"
+    docs = _merge_metadata(docs, load_metadata(metadata_csv))
 
     # Keep only chunks from usable documents
     chunks = chunks[chunks["doc_id"].isin(docs["doc_id"])].reset_index(drop=True)
