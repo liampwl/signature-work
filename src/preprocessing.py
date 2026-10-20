@@ -94,9 +94,19 @@ _HYPHEN_BREAK = re.compile(r"(\w)-\n(\w)")
 _BULLETS = re.compile(r"^[•●▪■–—\-\*o]\s+", re.M)
 
 
+_BAD_CATEGORIES = {"Cc", "Co", "Cs", "Cn"}  # control, private-use (symbol-font glyphs), surrogate, unassigned
+
+
+def strip_bad_chars(text: str) -> str:
+    """Replace control and private-use characters (common in PDF symbol fonts) with spaces."""
+    return "".join(
+        " " if (unicodedata.category(ch) in _BAD_CATEGORIES and ch != "\n") else ch for ch in text
+    )
+
+
 def normalise_block(text: str) -> str:
     """Unicode-normalise, repair line-break hyphenation, and flatten a block to one line."""
-    text = unicodedata.normalize("NFKC", text)
+    text = strip_bad_chars(unicodedata.normalize("NFKC", text))
     text = _HYPHEN_BREAK.sub(r"\1\2", text)
     text = _BULLETS.sub("", text)
     text = text.replace("\n", " ")
@@ -443,6 +453,9 @@ def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None
             payload = {"info": info, "kept": kept_, "counts": dict(local.counts)}
             cached.write_text(json.dumps(payload))
         info, kept = payload["info"], payload["kept"]
+        for p in kept:  # also cleans caches written before strip_bad_chars existed
+            p["text"] = " ".join(strip_bad_chars(p["text"]).split())
+        kept = [p for p in kept if len(p["text"].split()) >= cfg.MIN_PARAGRAPH_WORDS]
         fc.counts.update(payload["counts"])
         doc_id = len(seen_md5) - 1
         n_chunks = 0
