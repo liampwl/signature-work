@@ -7,6 +7,7 @@ matrix, so model selection doesn't re-embed the corpus each time.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ import config as cfg
 from src.utils import get_logger
 
 logger = get_logger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # silence per-file Hugging Face download logs
 
 
 def _device() -> str:
@@ -58,13 +60,31 @@ def embed_chunks(data_dir: Path, model_name: str = cfg.EMBEDDING_MODEL_NAME) -> 
         data_dir / "token_lengths.csv", index=False
     )
 
-    emb = model.encode(
-        texts,
-        batch_size=cfg.EMBED_BATCH_SIZE,
-        show_progress_bar=True,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    ).astype(np.float32)
+    # Encode in shards saved to disk, so the run can be stopped (Ctrl-C) and
+    # resumed: finished shards are skipped on the next run.
+    if cfg.EMBED_FP16 and model.device.type in ("mps", "cuda"):
+        model.half()
+        logger.info("Using fp16 on %s", model.device.type)
+    n = len(texts)
+    # Shards are tied to this model and corpus size, so a re-extracted corpus never reuses stale shards.
+    parts_dir = data_dir / f"embeddings_parts_{model_name.split('/')[-1]}_{n}"
+    parts_dir.mkdir(exist_ok=True)
+    shard = cfg.EMBED_SHARD_SIZE
+    n_shards = (n + shard - 1) // shard
+    for i in range(n_shards):
+        part = parts_dir / f"part_{i:04d}_of_{n_shards:04d}.npy"
+        if part.exists():
+            continue
+        logger.info("Shard %d/%d", i + 1, n_shards)
+        e = model.encode(
+            texts[i * shard:(i + 1) * shard],
+            batch_size=cfg.EMBED_BATCH_SIZE,
+            show_progress_bar=True,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).astype(np.float32)
+        np.save(part, e)
+    emb = np.vstack([np.load(parts_dir / f"part_{i:04d}_of_{n_shards:04d}.npy") for i in range(n_shards)])
 
     np.save(data_dir / "embeddings.npy", emb)
     (data_dir / "embeddings_model.txt").write_text(f"{model_name}\nmax_seq_length={max_len}\n")

@@ -58,6 +58,8 @@ NON_ENGLISH_MIN_PROB = 0.90
 # ---------- Embedding ----------
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2")
 EMBED_BATCH_SIZE = 64
+EMBED_SHARD_SIZE = 20_000       # chunks per saved shard; lets 02_embed.py stop and resume
+EMBED_FP16 = True               # half precision on Apple Silicon / CUDA: ~2x faster, negligible effect
 
 # ---------- Topic model ----------
 USE_SEED_TOPICS = True          # set False (or --no-seeds) for the unseeded robustness model
@@ -66,6 +68,10 @@ UMAP_N_COMPONENTS = 5
 UMAP_MIN_DIST = 0.0             # BERTopic default; tighter packing helps clustering
 UMAP_METRIC = "cosine"
 KMEANS_N_INIT = 10
+# UMAP is fit on a random sample and then applied to every chunk. Fitting on all
+# ~380k chunks with a fixed seed runs single-threaded and takes hours; 100k is
+# plenty to learn the manifold. Set to None to fit on everything.
+UMAP_FIT_SAMPLE = 100_000
 
 # Stability sweep: pick K from the sweep *before* looking at administration differences.
 SWEEP_K_GRID = [20, 30, 40, 50, 60, 75]

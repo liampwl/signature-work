@@ -260,6 +260,16 @@ def reduce_dimensions(embeddings: np.ndarray, y: np.ndarray | None, seed: int) -
         low_memory=True,
         verbose=True,
     )
+    n = len(embeddings)
+    if cfg.UMAP_FIT_SAMPLE and n > cfg.UMAP_FIT_SAMPLE:
+        idx = np.random.default_rng(seed).choice(n, cfg.UMAP_FIT_SAMPLE, replace=False)
+        reducer.fit(embeddings[idx], y=None if y is None else y[idx])
+        logger.info("UMAP fit on %d sampled chunks; transforming all %d ...", len(idx), n)
+        out = np.empty((n, cfg.UMAP_N_COMPONENTS), dtype=np.float32)
+        step = 50_000
+        for start in range(0, n, step):
+            out[start:start + step] = reducer.transform(embeddings[start:start + step])
+        return out
     return reducer.fit_transform(embeddings, y=y)
 
 
@@ -267,7 +277,8 @@ def get_reduced(data_dir: Path, embeddings: np.ndarray, seed: int, seeded: bool,
     """UMAP output for (seed, seeded), cached on disk."""
     cache = data_dir / "umap_cache"
     cache.mkdir(exist_ok=True)
-    path = cache / f"{'seeded' if seeded else 'unseeded'}_seed{seed}_nn{cfg.UMAP_N_NEIGHBORS}_d{cfg.UMAP_N_COMPONENTS}.npy"
+    path = cache / (f"{'seeded' if seeded else 'unseeded'}_seed{seed}_nn{cfg.UMAP_N_NEIGHBORS}"
+                    f"_d{cfg.UMAP_N_COMPONENTS}_fit{cfg.UMAP_FIT_SAMPLE or 'all'}.npy")
     if path.exists():
         red = np.load(path)
         if red.shape[0] == embeddings.shape[0]:
