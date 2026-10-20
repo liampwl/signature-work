@@ -12,6 +12,10 @@ different numbering. With --match-by-title, each unmatched PDF is matched to
 the year-only DEC row (same year) whose title words best appear on the PDF's
 first two pages; matches below --min-title-score are left unmatched.
 
+With --crosswalk (the pdf_dec_crosswalk.csv built for the AidData handoff,
+which also checks file sizes), its DEC_Unique_ID wins wherever it exists and
+the matching above is only a fallback.
+
     python scripts/00_build_metadata.py --dec-csv "SW DEC Database finalized jan9.csv" \
         --pdf-dir pdfs --out data/dec_metadata.csv --match-by-title
 """
@@ -90,6 +94,7 @@ def main():
     ap.add_argument("--date-format", default="%m/%d/%y", help="format of 'Publication Date' in the DEC CSV")
     ap.add_argument("--match-by-title", action="store_true")
     ap.add_argument("--min-title-score", type=float, default=0.8)
+    ap.add_argument("--crosswalk", type=Path, help="CSV with Local_Filename, DEC_Unique_ID, Match_Confidence")
     args = ap.parse_args()
 
     dec = pd.read_csv(args.dec_csv, dtype=str, keep_default_na=False, encoding_errors="replace")
@@ -109,6 +114,18 @@ def main():
         extra["title_score"] = m["score"].values
         out = pd.concat([out, extra], ignore_index=True)
         print(f"Title matching: {len(m)} of {len(unmatched)} unmatched PDFs matched (score >= {args.min_title_score})")
+
+    if args.crosswalk:
+        cw = pd.read_csv(args.crosswalk, dtype=str)
+        cw = cw[cw["Local_Filename"].isin(on_disk)].drop_duplicates("Local_Filename")
+        by_id = dec.drop_duplicates("Unique_ID").set_index("Unique_ID")
+        cw = cw[cw["DEC_Unique_ID"].isin(by_id.index)]
+        rows = build_rows(by_id.loc[cw["DEC_Unique_ID"]].reset_index(), cw["Local_Filename"], "crosswalk")
+        rows["match_confidence"] = cw["Match_Confidence"].values
+        prev = out.set_index("filename")["dec_unique_id"]
+        disagree = sum(1 for f, i in zip(rows["filename"], rows["dec_unique_id"]) if f in prev and prev[f] != i)
+        print(f"Crosswalk: {len(rows)} PDFs; disagrees with index/title matching on {disagree} (crosswalk kept)")
+        out = pd.concat([rows, out[~out["filename"].isin(rows["filename"])]], ignore_index=True)
 
     print(f"DEC rows: {len(dec)} | PDFs on disk: {len(on_disk)} | PDFs with metadata: {out['filename'].nunique()} "
           f"| without: {len(on_disk - set(out['filename']))}")

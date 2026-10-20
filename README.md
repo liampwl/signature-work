@@ -31,7 +31,7 @@ Topic-modeling pipeline for comparing USAID global health documents from the fir
 pip install -r requirements.txt
 
 # 0. Map PDF filenames back to the finalized DEC export (document type, geography, DEC ID)
-python scripts/00_build_metadata.py --dec-csv "SW DEC Database finalized jan9.csv" --pdf-dir /path/to/pdfs --out data/dec_metadata.csv --match-by-title
+python scripts/00_build_metadata.py --dec-csv "SW DEC Database finalized jan9.csv" --pdf-dir /path/to/pdfs --out data/dec_metadata.csv --match-by-title [--crosswalk pdf_dec_crosswalk.csv]
 
 # 1. PDFs -> chunks.csv, documents.csv, manifest.csv (MD5 per file), filter_counts.csv
 python scripts/01_extract_text.py --pdf-dir /path/to/pdfs --data-dir data [--metadata data/dec_metadata.csv]
