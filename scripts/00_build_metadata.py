@@ -69,7 +69,9 @@ def build_rows(dec: pd.DataFrame, filenames: pd.Series, how: str) -> pd.DataFram
     geo = dec.get("Descriptors_Geographic", pd.Series("", index=dec.index))
     return pd.DataFrame({
         "filename": filenames.values,
-        "doc_type": dec.get("Bibliographic_Type", pd.Series("Unknown", index=dec.index)).values,
+        # DEC uses two spellings for the same type
+        "doc_type": dec.get("Bibliographic_Type", pd.Series("Unknown", index=dec.index))
+        .str.replace("Project Program Overview", "Project/Program Overview", regex=False).values,
         "country": geo.map(geography).values,
         "geography_raw": geo.values,
         "primary_subject": dec.get("Primary_Subject", pd.Series("", index=dec.index)).values,

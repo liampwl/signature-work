@@ -461,6 +461,8 @@ def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None
         n_chunks = 0
         for p_idx, p in enumerate(kept):
             for c_idx, chunk in enumerate(chunk_paragraph(p["text"])):
+                if len(chunk.split()) < 5:  # fragments left over from hard splits
+                    continue
                 chunk_rows.append({
                     "doc_id": doc_id,
                     "filename": pdf.name,
