@@ -17,13 +17,15 @@ def main():
     ap.add_argument("--pdf-dir", type=Path, default=cfg.PDF_DIR)
     ap.add_argument("--data-dir", type=Path, default=cfg.DATA_DIR)
     ap.add_argument("--metadata", default=cfg.METADATA_CSV, help="DEC export CSV (optional)")
+    ap.add_argument("--time-budget", type=float, default=None,
+                    help="stop after this many seconds; finished PDFs are cached, so re-run to resume")
     ap.add_argument("--metadata-only", action="store_true",
                     help="re-attach --metadata to an existing documents.csv without re-extracting")
     args = ap.parse_args()
     if args.metadata_only:
         attach_metadata(args.data_dir, args.metadata)
     else:
-        extract_corpus(args.pdf_dir, args.data_dir, args.metadata)
+        extract_corpus(args.pdf_dir, args.data_dir, args.metadata, args.time_budget)
 
 
 if __name__ == "__main__":

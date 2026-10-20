@@ -23,7 +23,9 @@ What changed from the thesis (v1) pipeline, and why:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -69,6 +71,11 @@ def date_from_filename(filename: str) -> date | None:
 def administration_for(d: date | None) -> str:
     if d is None:
         return "Unknown"
+    # 2021-01-01 is what the thesis date-cleaning assigned to year-only and
+    # month-only January 2021 documents, so it can't be placed on either side
+    # of the 20 January inauguration. Excluded from comparisons.
+    if d == date(2021, 1, 1):
+        return "Ambiguous"
     if cfg.TRUMP_START <= d < cfg.BIDEN_START:
         return "Trump"
     if cfg.BIDEN_START <= d < cfg.BIDEN_END:
@@ -379,7 +386,8 @@ def attach_metadata(data_dir: Path, metadata_csv: str) -> None:
 # Corpus driver
 # ---------------------------------------------------------------------------
 
-def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None) -> None:
+def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None,
+                   time_budget: float | None = None) -> None:
     """
     Writes to out_dir:
       chunks.csv          one row per chunk (the unit that gets embedded)
@@ -394,8 +402,20 @@ def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None
     fc = FilterCounts()
     manifest, chunk_rows, seen_md5 = [], [], {}
 
+    # Per-PDF cache so a long extraction can be stopped and resumed
+    # (--time-budget) without redoing finished files.
+    cache_dir = out_dir / "extract_cache"
+    cache_dir.mkdir(exist_ok=True)
+    started = time.monotonic()
+    complete = True
+    md5_cache_path = out_dir / "md5_cache.json"
+    md5_cache = json.loads(md5_cache_path.read_text()) if md5_cache_path.exists() else {}
+
     for pdf in tqdm(pdfs, desc="Extracting"):
-        md5 = _md5(pdf)
+        st = pdf.stat()
+        key = f"{pdf.name}|{st.st_size}|{int(st.st_mtime)}"
+        md5 = md5_cache.get(key) or _md5(pdf)
+        md5_cache[key] = md5
         d = date_from_filename(pdf.name)
         row = {
             "filename": pdf.name,
@@ -410,8 +430,20 @@ def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None
             continue
         seen_md5[md5] = pdf.name
 
-        paras, info = extract_paragraphs(pdf, fc)
-        kept = [p for p in paras if keep_paragraph(p["text"], fc)]
+        cached = cache_dir / f"{md5}.json"
+        if cached.exists():
+            payload = json.loads(cached.read_text())
+        else:
+            if time_budget and time.monotonic() - started > time_budget:
+                complete = False
+                break
+            local = FilterCounts()
+            paras, info = extract_paragraphs(pdf, local)
+            kept_ = [p for p in paras if keep_paragraph(p["text"], local)]
+            payload = {"info": info, "kept": kept_, "counts": dict(local.counts)}
+            cached.write_text(json.dumps(payload))
+        info, kept = payload["info"], payload["kept"]
+        fc.counts.update(payload["counts"])
         doc_id = len(seen_md5) - 1
         n_chunks = 0
         for p_idx, p in enumerate(kept):
@@ -436,6 +468,11 @@ def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None
             n_paragraphs=len(kept), n_chunks=n_chunks,
         )
         manifest.append(row)
+
+    md5_cache_path.write_text(json.dumps(md5_cache))
+    if not complete:
+        logger.info("Time budget reached after %d of %d PDFs; run again to continue.", len(manifest), len(pdfs))
+        return
 
     manifest_df = pd.DataFrame(manifest)
     manifest_df.to_csv(out_dir / "manifest.csv", index=False)
