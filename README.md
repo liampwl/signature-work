@@ -48,11 +48,21 @@ python scripts/03_sweep.py --data-dir data --no-seeds        # robustness: ungui
 # 4. Final model at the chosen K
 python scripts/04_train_model.py --data-dir data --k 40 --k-rationale "highest seed ARI with <2 single-doc topics" [--gpt-labels]
 
+# 1b. (corpora extracted before the cleanup rules) drop boilerplate/debris chunks without re-embedding
+python scripts/01b_clean_chunks.py --data-dir data
+
 # 5. Administration comparison and robustness checks
 python scripts/05_run_analysis.py --data-dir data --model-dir outputs/final_k40_seeded
 ```
 
 The DEC metadata CSV is optional. Column names are auto-detected; otherwise set `META_FILENAME_COL`, `META_DOCTYPE_COL` and `META_COUNTRY_COL` in `.env`.
+
+Robustness across K, seeds and unseeded models, plus the topic-free term-mention tests:
+
+```bash
+bash scripts/run_robustness_models.sh data outputs 40 "why K=40"   # fits 6 models, then 06_robustness.py
+python scripts/07_mention_tests.py --data-dir data --out-dir outputs/mentions
+```
 
 ## Main outputs (`outputs/final_k*/analysis/`)
 
