@@ -113,4 +113,7 @@ MENTION_TERMS = {
     "climate": r"climate change|climate resilien",
     "equity": r"health equity|\bequitable\b",
     "localization": r"locali[sz]ation|local partner|locally led",
+    "self_reliance": r"self-reliance|journey to self",   # USAID's 2018-2020 framing under Administrator Green
+    "zika": r"\bzika",
+    "pepfar": r"\bpepfar",
 }

@@ -61,3 +61,43 @@ def mentions_by_year(chunks: pd.DataFrame, docs: pd.DataFrame, out_dir: Path) ->
     by_year.to_csv(out_dir / "mentions_by_year.csv")
     by_admin.to_csv(out_dir / "mentions_by_administration.csv")
     return by_admin
+
+
+def mention_indicators(chunks: pd.DataFrame, docs: pd.DataFrame) -> pd.DataFrame:
+    """One row per document: True/False for each term family in cfg.MENTION_TERMS."""
+    text = chunks.groupby("doc_id")["text"].apply(lambda s: " ".join(s).lower())
+    t = docs["doc_id"].map(text).fillna("")
+    return pd.DataFrame({name: t.map(lambda s, rx=re.compile(p): bool(rx.search(s)))
+                         for name, p in cfg.MENTION_TERMS.items()}, index=docs.index)
+
+
+def mention_tests(chunks: pd.DataFrame, docs: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
+    """
+    For each term family: share of Trump- and Biden-era documents that mention it,
+    a document-level permutation test of the difference (BH-FDR across terms), and
+    the same trend-adjusted linear probability model used for topics (document
+    type, country, linear time trend, COVID period; HC3 SEs). Label-free, so these
+    don't depend on any topic-model choice.
+    """
+    from src.analysis.prevalence import bh_fdr, covariate_regressions, permutation_test
+
+    m = mention_indicators(chunks, docs).astype(float)
+    is_b = (docs["administration"] == "Biden").to_numpy()
+    obs, p = permutation_test(m.to_numpy(), is_b)
+    out = pd.DataFrame({
+        "term": m.columns,
+        "trump_share": m[~is_b].mean().to_numpy(),
+        "biden_share": m[is_b].mean().to_numpy(),
+        "diff": obs,
+        "n_docs_trump": int((~is_b).sum()),
+        "n_docs_biden": int(is_b.sum()),
+        "p_perm": p,
+        "q_perm": bh_fdr(p),
+    })
+    reg = covariate_regressions(m.to_numpy(), docs, trend=True)
+    if reg is not None:
+        reg = reg.rename(columns={"biden_coef": "jump_at_inauguration", "q_value": "q_trend"})
+        reg["term"] = m.columns[reg["topic"].to_numpy()]
+        out = out.merge(reg[["term", "jump_at_inauguration", "ci_low", "ci_high", "q_trend"]], on="term", how="left")
+    out.to_csv(out_dir / "mention_tests.csv", index=False)
+    return out

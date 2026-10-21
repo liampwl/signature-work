@@ -12,7 +12,7 @@ import pandas as pd
 
 import _common  # noqa: F401
 import config as cfg
-from src.analysis.inspection import mentions_by_year, reading_samples
+from src.analysis.inspection import mention_tests, mentions_by_year, reading_samples
 from src.analysis.prevalence import run_prevalence
 from src.analysis.report import plot_differences, plot_yearly, write_summary
 from src.analysis.separability import doc_mean_embeddings, separability
@@ -68,6 +68,7 @@ def main():
 
     reading_samples(chunks_s, topics_s, docs, info, out)
     mentions = mentions_by_year(chunks_s, docs, out)
+    mention_tests(chunks_s, docs, out)
 
     seeded = "unseeded" not in args.model_dir.name
     write_summary(out, docs, chunks_s, info, table, sep, mentions, k, seeded)
