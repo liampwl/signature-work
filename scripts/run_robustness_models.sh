@@ -7,7 +7,16 @@ cd "$(dirname "$0")/.."
 
 run () {  # name, extra args for 04, extra args for 05
   local name="$1"; shift
-  if [ -f "$O/$name/analysis/administration_comparison.csv" ]; then echo "== $name already done"; return; fi
+  # Skip only if a finished run exists AND it was fit on the current chunks.csv
+  # (a run from before 01b_clean_chunks.py has a different number of chunks).
+  if [ -f "$O/$name/analysis/administration_comparison.csv" ] && \
+     [ "$(wc -l < "$O/$name/topics.csv")" -eq "$(wc -l < "$D/chunks.csv")" ]; then
+    echo "== $name already done"; return
+  fi
+  if [ -d "$O/$name" ]; then
+    echo "== $name exists but was fit on a different corpus; moving it to ${name}_stale"
+    rm -rf "$O/${name}_stale"; mv "$O/$name" "$O/${name}_stale"
+  fi
   echo "== $name"
   python scripts/04_train_model.py --data-dir "$D" --out-dir "$O/$name" "$@"
   python scripts/05_run_analysis.py --data-dir "$D" --model-dir "$O/$name" $SEP
