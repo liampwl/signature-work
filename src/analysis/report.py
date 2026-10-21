@@ -83,7 +83,8 @@ def write_summary(out_dir: Path, docs: pd.DataFrame, chunks: pd.DataFrame, topic
         f"- Topics with document-level FDR q < {cfg.FDR_ALPHA}: {n_sig} of {len(table)}",
     ]
     for col, name in [("q_perm_within_doctype", "within document type"), ("q_regression", "regression with controls"),
-                      ("q_excl_early", f"excluding first {cfg.LAG_EXCLUSION_DAYS} days of each term")]:
+                      ("q_excl_early", f"excluding first {cfg.LAG_EXCLUSION_DAYS} days of each term"),
+                      ("q_trend", "with controls + time trend + COVID period (jump at inauguration)")]:
         if col in table:
             lines.append(f"  - still q < {cfg.FDR_ALPHA} {name}: {int((table[col] < cfg.FDR_ALPHA).sum())}")
     lines += ["", "## Largest differences (Biden minus Trump, mean document share)", ""]
@@ -92,7 +93,7 @@ def write_summary(out_dir: Path, docs: pd.DataFrame, chunks: pd.DataFrame, topic
     show["ci_pp"] = [f"[{lo*100:.2f}, {hi*100:.2f}]" for lo, hi in zip(show.diff_ci_low, show.diff_ci_high)]
     show["topic_desc"] = [_short(r) for _, r in show.iterrows()]
     cols = ["topic_desc", "diff_pp", "ci_pp", "q_perm", "n_docs", "top_doc_share"]
-    for extra in ["q_perm_within_doctype", "q_regression", "q_excl_early"]:
+    for extra in ["q_perm_within_doctype", "q_regression", "q_excl_early", "q_trend"]:
         if extra in show:
             cols.append(extra)
     lines.append(show[cols].round(4).to_markdown(index=False))

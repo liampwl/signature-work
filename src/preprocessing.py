@@ -332,6 +332,42 @@ def _md5(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Chunk-level cleanup (applied after extraction; also usable on an existing
+# chunks.csv + embeddings.npy without re-embedding, see scripts/01b_clean_chunks.py)
+# ---------------------------------------------------------------------------
+
+_DISCLAIMER = re.compile(
+    r"(?:do(?:es)? not necessarily reflect|made possible by the (?:generous )?support of the american people"
+    r"|are the (?:sole )?responsibility of|prepared for (?:review|publication) by|this (?:publication|report|document) was "
+    r"(?:produced|prepared|made possible)|contents are the responsibility)",
+    re.I,
+)
+_NUMERIC_TOKEN = re.compile(r"^[\d.,%:/()\-+]+$|^(n/?a|tbd|yes|no|x)$", re.I)
+
+
+def chunk_flags(chunks: pd.DataFrame, repeat_min_docs: int = 5) -> pd.DataFrame:
+    """
+    Flag chunks that are boilerplate or extraction debris rather than prose:
+      disclaimer      USAID/implementer disclaimer and credit text
+      repeated_text   identical (normalised) text in >= repeat_min_docs documents
+      garbled         >40% of tokens are 1-2 characters (broken font encodings, e.g. "ng er nt")
+      table_cells     >30% of tokens are numbers/percentages/N/A (table rows read as text)
+    """
+    text = chunks["text"].astype(str)
+    norm = text.str.lower().str.replace(r"[^a-z ]", "", regex=True).str.split().str.join(" ")
+    docs_per_text = chunks.assign(_n=norm).groupby("_n")["doc_id"].nunique()
+    tokens = text.str.split()
+    short = tokens.map(lambda t: sum(len(w) <= 2 for w in t) / max(len(t), 1))
+    numeric = tokens.map(lambda t: sum(bool(_NUMERIC_TOKEN.match(w)) for w in t) / max(len(t), 1))
+    return pd.DataFrame({
+        "disclaimer": text.str.contains(_DISCLAIMER),
+        "repeated_text": norm.map(docs_per_text).fillna(0).to_numpy() >= repeat_min_docs,
+        "garbled": short > 0.4,
+        "table_cells": numeric > 0.3,
+    }, index=chunks.index)
+
+
+# ---------------------------------------------------------------------------
 # Optional DEC metadata
 # ---------------------------------------------------------------------------
 
@@ -499,8 +535,11 @@ def extract_corpus(pdf_dir: Path, out_dir: Path, metadata_csv: str | None = None
 
     docs = _merge_metadata(docs, load_metadata(metadata_csv))
 
-    # Keep only chunks from usable documents
+    # Keep only chunks from usable documents, minus boilerplate / extraction debris
     chunks = chunks[chunks["doc_id"].isin(docs["doc_id"])].reset_index(drop=True)
+    flags = chunk_flags(chunks)
+    pd.DataFrame(flags.sum(), columns=["chunks_removed"]).to_csv(out_dir / "chunk_filter_counts.csv")
+    chunks = chunks[~flags.any(axis=1)].reset_index(drop=True)
     chunks.insert(0, "chunk_id", range(len(chunks)))
 
     chunks.to_csv(out_dir / "chunks.csv", index=False)

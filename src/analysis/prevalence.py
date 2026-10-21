@@ -108,11 +108,18 @@ def bootstrap_ci(shares: np.ndarray, is_biden: np.ndarray, n_boot: int = 2000,
     return np.quantile(diffs, 0.025, axis=0), np.quantile(diffs, 0.975, axis=0)
 
 
-def covariate_regressions(shares: np.ndarray, docs: pd.DataFrame) -> pd.DataFrame | None:
+def covariate_regressions(shares: np.ndarray, docs: pd.DataFrame, trend: bool = False) -> pd.DataFrame | None:
     """
     Per topic: OLS of document share on Biden + document type + country (HC3 SEs).
     Linear probability on shares is crude but transparent; the point is whether
     the administration coefficient survives the controls.
+
+    trend=True also adds a linear time trend and a COVID-period indicator
+    (documents dated on/after 2020-03-11). The Biden coefficient then measures
+    a jump at the inauguration over and above a steady trend and the pandemic.
+    Administration and time are confounded in this design, so this is the
+    stricter test: a topic that was already rising or falling before 2021, or
+    that moved with COVID (which began under Trump), loses its "Biden effect".
     """
     import statsmodels.formula.api as smf
 
@@ -122,8 +129,11 @@ def covariate_regressions(shares: np.ndarray, docs: pd.DataFrame) -> pd.DataFram
         logger.info("No document-type/country metadata; skipping covariate regressions.")
         return None
 
-    df = docs[["administration", "doc_type", "country"]].copy()
+    df = docs[["administration", "doc_type", "country", "date"]].copy()
     df["biden"] = (df["administration"] == "Biden").astype(int)
+    years = df["date"].dt.year + (df["date"].dt.dayofyear - 1) / 365.25
+    df["year_c"] = years - 2021.05
+    df["covid"] = (df["date"] >= pd.Timestamp("2020-03-11")).astype(int)
     top = df["country"].value_counts().head(cfg.TOP_COUNTRIES).index
     df["country_c"] = np.where(df["country"].isin(top), df["country"], "Other")
 
@@ -132,6 +142,8 @@ def covariate_regressions(shares: np.ndarray, docs: pd.DataFrame) -> pd.DataFram
         rhs += " + C(doc_type)"
     if has_country:
         rhs += " + C(country_c)"
+    if trend:
+        rhs += " + year_c + covid"
 
     rows = []
     for t in range(shares.shape[1]):
@@ -200,6 +212,12 @@ def run_prevalence(shares: np.ndarray, docs: pd.DataFrame, chunk_topics: np.ndar
         reg.to_csv(out_dir / "covariate_regressions.csv", index=False)
         table = table.merge(reg[["topic", "biden_coef", "ci_low", "ci_high", "q_value"]]
                             .rename(columns={"q_value": "q_regression"}), on="topic", how="left")
+    reg_t = covariate_regressions(shares, docs, trend=True)
+    if reg_t is not None:
+        reg_t.to_csv(out_dir / "covariate_regressions_trend.csv", index=False)
+        table = table.merge(reg_t[["topic", "biden_coef", "q_value"]]
+                            .rename(columns={"biden_coef": "biden_coef_trend", "q_value": "q_trend"}),
+                            on="topic", how="left")
 
     cols = ["topic", "keywords", "gpt_label", "n_docs", "top_doc_share", "single_doc_dominated", "npmi"]
     table = topic_info[[c for c in cols if c in topic_info.columns]].merge(table, on="topic")
