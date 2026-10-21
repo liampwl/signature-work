@@ -76,7 +76,7 @@ def parse(xml_path: Path) -> pd.DataFrame:
                     "description": _text(el, "Description"),
                 })
             el.clear()
-        elif el.tag.startswith(NS + "Opportunity"):
+        elif el.tag.endswith("Detail_1_0"):  # forecasts etc.: free memory (never clear child fields early)
             el.clear()
     df = pd.DataFrame(rows)
     df["version_n"] = pd.to_numeric(df["version"].str.extract(r"(\d+)")[0], errors="coerce").fillna(0)
